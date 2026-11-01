@@ -25,20 +25,22 @@
 本插件通过 **三层渐进式暴露协议（Progressive Tool Disclosure）** 彻底解决上述问题：
 
 ### 1. 顶层 Wire Schema 极简化（~80% 瘦身）
-- 顶层仅向 LLM 暴露约 10~15 个高频核心操作工具（如文件读写、命令行、子代理及本调度器的 3 个元工具）。
-- 其余 120+ 个低频、重型领域工具（MCP、工作流、多智能体协同、专业图像处理等）从顶层 Wire Schema 中折叠移除。
+- 顶层默认仅常驻 DSH 官方内置核心工具：文件（`read`, `read_image`, `write`, `edit`, `str_replace_editor`）、搜索（`glob`, `grep`）、终端（`bash`, `pwsh`）、子代理（`subagent`）、网络（`web_search`, `web_fetch`）、技能（`skill`）、交互（`ask_user_question`）、规划（`todo_write`）、成果物（`present`）、元工具及 PTC 传输（`list_tools`, `get_tool_schema`, `call_tool`, `run_code`）。
+- 本地扩展或 MCP 工具请通过 `pinnedTools` 配置按需常驻；其余低频与重型工具动态折叠。
 
-### 2. 动态工具发现工具：`list_tools` (带 Search Action)
+### 2. 动态工具发现工具：`list_tools` (单次查询返回完整用法)
 - 大模型遇到不确定的需求或不知道用什么工具时，无需靠猜，直接调用 `list_tools` 动态检索。
 - 支持 `action: 'search' | 'list'`，支持关键词与意图模糊搜索（如 `query: "screenshot"`、`query: "image"`、`query: "git"`）。
-- **描述自动截断**：返回的工具摘要自动精简至一句话（~120 字符内），杜绝长描述倒灌污染上下文。
+- **一次查询返回完整用法**：对任何检索 `query`，单次调用即可返回每个匹配工具的完整长描述（不截断）以及紧凑的参数 JSON Schema。若匹配工具数超出 `maxFullResults`（默认 10），前 10 个展示完整用法，其余工具仅列出名称。
+- **单行精简目录**：无查询词的纯浏览 `action: 'list'` 保留紧凑单行格式（约 200 字符内），避免长文本污染。
 
-### 3. 按需拉取 Schema：`get_tool_schema`
-- 模型发现所需工具后，按需查询该工具的完整参数规范与 JSON Schema。
+### 3. 按需拉取 Schema：`get_tool_schema` (支持单工具及批量)
+- 模型发现所需工具后，可按需查询特定工具的完整参数规范与 JSON Schema，支持单个 `name` 或批量 `names: [...]` 查询。
 
-### 4. 万能代理调用：`call_tool`（100% 多模态保真）
+### 4. 万能代理调用：`call_tool`（100% 多模态保真与 UI 卡片复用）
 - 模型直接通过 `call_tool({ name, arguments })` 代理执行被折叠的工具。
 - **媒体块零损失**：深度适配 DSH 的 `ContentBlock` 管线，底层透传 `ImageBlock` 及其附件元数据。`read_image`、浏览器截图、多媒体分析等工具生成的图片能够 **原样送达视觉模型与 Web UI**。
+- **UI 卡片无缝复用**：自动代理目标工具的 `presentCall` 与 `presentResult`，复用专业 UI 卡片展示与元数据透传，兜底保障安全回退。
 
 ---
 
@@ -128,7 +130,7 @@ pnpm add dsh-tool-lazy-dispatcher
 ## 🛠️ API 工具参考
 
 ### 1. `list_tools`
-动态搜索或列出可用工具。
+动态搜索或列出可用工具。通过 `query` 检索时一次性返回完整用法与参数 Schema。
 
 | 参数 | 类型 | 必填 | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -148,18 +150,21 @@ pnpm add dsh-tool-lazy-dispatcher
 ```
 
 ### 2. `get_tool_schema`
-按需查询特定工具的完整 JSON Schema。
+按需查询特定工具或批量工具的完整 JSON Schema。
 
 | 参数 | 类型 | 必填 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `name` | `string` | 是 | 需要查询的目标工具全名 |
+| `name` | `string` | 否* | 单工具查询的目标工具名 |
+| `names` | `string[]` | 否* | 批量工具查询的目标工具名数组 |
+
+*\*`name` 与 `names` 至少需提供其一。*
 
 **调用示例**：
 ```json
 {
   "name": "get_tool_schema",
   "arguments": {
-    "name": "mcp__chrome__take_screenshot"
+    "names": ["mcp__chrome__take_screenshot", "read_image"]
   }
 }
 ```
