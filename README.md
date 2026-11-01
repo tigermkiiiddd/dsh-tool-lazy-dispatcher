@@ -102,9 +102,9 @@ dsh plugin install github:tigermkiiiddd/dsh-tool-lazy-dispatcher
 
 ### Method 3: Manual Monorepo / Profile Patch
 
-1. Install the package into your project:
+1. Install the package from GitHub into your project or profile:
 ```bash
-pnpm add dsh-tool-lazy-dispatcher
+pnpm add github:tigermkiiiddd/dsh-tool-lazy-dispatcher
 ```
 
 2. Register the plugin in your Cordis patch configuration (e.g. `cordis.patch.yml`):

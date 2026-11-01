@@ -102,9 +102,9 @@ dsh plugin install github:tigermkiiiddd/dsh-tool-lazy-dispatcher
 
 ### 方式三：手动配置与二次开发
 
-1. 在项目或 profile 中安装依赖：
+1. 在项目或 profile 中从 GitHub 安装依赖：
 ```bash
-pnpm add dsh-tool-lazy-dispatcher
+pnpm add github:tigermkiiiddd/dsh-tool-lazy-dispatcher
 ```
 
 2. 在 Cordis 配置补丁文件（如 `cordis.patch.yml`）中挂载插件：
