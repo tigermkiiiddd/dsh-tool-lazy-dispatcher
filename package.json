@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-lazy-dispatcher",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Dynamic tool lazy folding and progressive disclosure dispatcher for DeepSeek Harness (DSH) and Cordis",
   "type": "module",
   "main": "lib/index.js",
@@ -54,6 +54,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
     "@deepseek-ai/dsh-llm": "*",
     "@deepseek-ai/dsh-settings": "*",
     "@deepseek-ai/dsh-system-prompt": "*",

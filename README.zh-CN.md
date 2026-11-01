@@ -76,6 +76,24 @@
 
 ---
 
+## 📌 DSH 版本兼容性
+
+本插件跟随 DeepSeek Harness 的**预发布**插件 API，因此与具体 DSH 版本绑定。
+
+| 插件版本 | DeepSeek Harness | 折叠机制 |
+|---|---|---|
+| `1.2.0` | `>= 0.2.2-alpha.2` | 按 agent 调用 `tools.restrict()`；使用批量工具执行 API |
+| `1.1.0` 及更早 | `< 0.2.2-alpha.2` | 改写 `system-prompt/assemble`；使用单次调用执行器入参 |
+
+**这两行不能混用。** 旧插件配新 DSH（或反之）会以看起来与本插件无关的方式失败：
+
+- **`Cannot read properties of undefined (reading 'length')`，错误码 `UNKNOWN`，切换模型后每一轮都失败。** `1.1.0` 及更早在 `system-prompt/assemble` 瀑布里读取 `assembly.tools`。该瀑布收到的是 `PromptPresentation`（sections、contexts、variables），而 DSH 在瀑布返回**之后**才用自己的局部变量为结果赋上 `tools`，所以监听器拿到的值里从来没有这个字段。读取它的 `.length` 会在 step 准备阶段抛出，整个 turn 在任何请求发出前就中断。
+- **`tool "list_tools" is already registered`。** 若 bundle 在 host 层和 agent preset 里各列一次本插件，它会被加载两次。`1.2.0` 让元工具按进程幂等；更早的版本会直接让整个组合失败。
+
+`1.2.0` 改为按 agent 折叠：在 agent 自己的 context 上调用 `tools.restrict()`，同时从该 agent 的 schema、查找**和执行**中移除被折叠的工具，披露目录也挂在同一个 context 上。请只在**一处**注册本插件——要么放在需要折叠的 preset 里，要么在全 agent 折叠方式相同的情况下放在 host 层。
+
+---
+
 ## 🚀 安装与启用
 
 ### 方式一：在 DSH 图形界面直接安装（最推荐）

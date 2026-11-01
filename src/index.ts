@@ -12,6 +12,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool, type ToolRunContext, type ToolResult } from '@deepseek-ai/dsh-tools'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -108,6 +109,27 @@ export const MANDATORY_META_TOOLS: readonly string[] = [
   'get_tool_schema',
   'call_tool',
 ]
+
+/** Root contexts that already registered the meta-tools in this process. */
+const META_TOOL_OWNER = new WeakSet<Context>()
+
+/**
+ * Claim ownership of the process-global meta-tools.
+ *
+ * A bundle may list this plugin in the host plane and again in an agent preset.
+ * `tools.register()` rejects a duplicate global name, so the second mount must
+ * not re-register them. Ownership is tracked per root context because both
+ * mounts share one registry.
+ * @param ctx - context mounting this plugin instance.
+ * @returns whether this mount is the one that registers the meta-tools.
+ */
+function claimMetaTools(ctx: Context): boolean {
+  const owner = ctx.root
+  if (META_TOOL_OWNER.has(owner)) return false
+  META_TOOL_OWNER.add(owner)
+  ctx.effect(() => () => { META_TOOL_OWNER.delete(owner) }, 'tool-lazy-dispatcher: meta-tool ownership')
+  return true
+}
 
 /** Resolve the effective set of pinned tool names from defaults, config, and settings. */
 function resolvePinnedTools(ctx: Context, config: Config): Set<string> {
@@ -261,9 +283,14 @@ export function parseInnerArgs(raw: unknown): Record<string, unknown> {
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
+  // The meta-tools are process-global singletons. A bundle may list this plugin
+  // twice — once in the host plane and once in an agent preset — and a second
+  // `register()` would otherwise reject the duplicate name and fail the whole
+  // composition. The first mount owns the tools; later mounts skip them.
+  const ownsTools = claimMetaTools(ctx)
 
   // 1. Register list_tools (with search action and query)
-  ctx.tools.register(defineTool({
+  if (ownsTools) ctx.tools.register(defineTool({
     name: 'list_tools',
     description: 'List or search available tools by keyword or intent. Use this to discover specialized tools when uncertain.',
     parameters: {
@@ -363,7 +390,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   }))
 
   // 2. Register get_tool_schema
-  ctx.tools.register(defineTool({
+  if (ownsTools) ctx.tools.register(defineTool({
     name: 'get_tool_schema',
     description: 'Inspect the full JSON schema, parameter specifications, and requirements for a specialized or folded tool before calling it.',
     parameters: {
@@ -429,7 +456,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   // 3. Register call_tool with 100% ContentBlock fidelity (preserving ImageBlocks, FileBlocks, etc.)
   let subCallCounter = 0
-  ctx.tools.register(defineTool({
+  if (ownsTools) ctx.tools.register(defineTool({
     name: 'call_tool',
     description: 'Universal dispatch proxy to execute any available folded or specialized tool by name with its arguments.',
     parameters: {
@@ -467,20 +494,32 @@ export function apply(ctx: Context, config: Config = {}): void {
       const targetArgs = parseInnerArgs(args.arguments)
       const subCallId = ToolCallId(`${String(exec.callId)}:dispatch:${++subCallCounter}:${targetName}`)
 
-      const result = await ctx.tools.execute({
-        callId: subCallId,
-        rootCallId: exec.rootCallId ?? exec.callId,
-        name: targetName,
-        arguments: targetArgs,
-        ...(exec.agent !== undefined ? { agent: exec.agent } : {}),
-        parent: exec.token,
+      // DSH 0.2.2-alpha.2 replaced the single-call executor input with a batch:
+      // arguments travel as raw JSON, and the outcome is `results[0].result`.
+      const batchResult = await ctx.tools.execute({
+        calls: [{
+          type: 'tool-call',
+          id: subCallId,
+          name: targetName,
+          arguments: JSON.stringify(targetArgs),
+        }],
         signal: exec.signal,
+        ...(exec.agent !== undefined ? { agent: exec.agent } : {}),
       })
 
-      if (result.additionalContexts) {
-        for (const extra of result.additionalContexts) {
+      if (batchResult.additionalContexts) {
+        for (const extra of batchResult.additionalContexts) {
           exec.deferContext(extra)
         }
+      }
+
+      if (batchResult.concluded) {
+        exec.concludeTurn()
+      }
+
+      const result = batchResult.results[0]?.result
+      if (result === undefined) {
+        throw new Error(`Tool "${targetName}" returned no result`)
       }
 
       if (result.concludesTurn) {
@@ -564,44 +603,102 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
   }))
 
-  // 4. Intercept system-prompt assembly to fold non-pinned tools and append concise progressive disclosure guide
-  ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-    const assembly = await next()
-    if (!isFoldingEnabled(ctx, config)) return assembly
+  // 4. Fold non-pinned tools per agent.
+  //
+  // Folding cannot happen on `system-prompt/assemble`. That waterfall receives a
+  // `PromptPresentation` — sections, contexts, variables — and `assemble()`
+  // overwrites `tools` from its own local variable after the waterfall returns, so
+  // mutating the result there never reached the wire. Reading `assembly.tools`
+  // there also assumed a field the waterfall never promises: where the field was
+  // absent, this hook threw `Cannot read properties of undefined (reading
+  // 'length')` and failed the whole turn. `tools.restrict()` is the supported
+  // seam: it removes tools from one agent view, keeping schema presentation,
+  // lookup, and execution aligned.
+  //
+  // The restriction refreshes when an agent starts running. `agent/pre-step` is
+  // too late: the loop resolves tool admission and assembles the prompt *before*
+  // that waterfall runs, so a restriction installed there misses its own step.
+  const folding = new WeakMap<Agent, { dispose: () => void; denied: readonly string[]; text: string }>()
 
-    // In PTC mode, only run_code is visible on wire anyway
-    if (assembly.tools.length <= 1 && assembly.tools[0]?.name === 'run_code') {
-      return assembly
+  const hiddenToolOf = (agent: Agent, name: string): { name: string; description: string; parameters?: unknown } => {
+    const definition = ctx.tools.get(name, agent)
+    return {
+      name,
+      description: definition?.description ?? '',
+      ...definition?.parameters === undefined ? {} : { parameters: definition.parameters },
     }
+  }
 
-    const pinnedSet = resolvePinnedTools(ctx, config)
-    const activeTools = assembly.tools.filter(t => pinnedSet.has(t.name) || t.name === 'list_tools' || t.name === 'get_tool_schema' || t.name === 'call_tool')
-    const foldedTools = assembly.tools.filter(t => !pinnedSet.has(t.name) && t.name !== 'list_tools' && t.name !== 'get_tool_schema' && t.name !== 'call_tool')
+  const refreshFolding = (agent: Agent): void => {
+    if (!isFoldingEnabled(ctx, config)) return
+    const pinned = resolvePinnedTools(ctx, config)
+    const installed = folding.get(agent)
+    // A tool this plugin already hid is absent from `schemas()`, so the previous
+    // denial is unioned back in: otherwise every refresh would compute an empty
+    // candidate set and dispose the restriction that produced it.
+    const known = new Set([
+      ...ctx.tools.schemas(agent).map(tool => tool.name),
+      ...installed?.denied ?? [],
+    ])
+    for (const meta of MANDATORY_META_TOOLS) known.delete(meta)
+    // In PTC mode only run_code reaches the wire, so folding adds nothing.
+    if (known.size === 0 || (known.size === 1 && known.has('run_code'))) return
+    const folded = [...known].filter(name => !pinned.has(name)).sort()
+    if (installed !== undefined && installed.denied.join('\n') === folded.join('\n')) return
+    installed?.dispose()
+    folding.delete(agent)
+    if (folded.length === 0) return
+    const text = renderDirectory(folded.map(name => hiddenToolOf(agent, name)))
+    const dispose = agent.ctx.tools.restrict({ deny: folded })
+    folding.set(agent, { dispose, denied: folded, text })
+  }
 
-    if (foldedTools.length === 0) return assembly
-
-    assembly.tools = activeTools
-
-    // Summarize descriptions (up to 140 chars) so the prompt stays compact and predictable
-    const inventoryLines = [
-      '## Specialized & Domain Tools (Progressive Disclosure)',
-      'To optimize KV Cache and context tokens, full parameter schemas for specialized domain tools are folded.',
-      '- To search/discover tools: call `list_tools({ query: "<keyword>" })` (returns complete descriptions and parameter schemas for matching tools in one call).',
-      '- To view all tool categories or directory: call `list_tools({ action: "list" })`.',
-      '- To inspect complete parameter specifications: call `get_tool_schema({ name: "<tool_name>" })`.',
-      '- To execute any folded tool: call `call_tool({ name: "<tool_name>", arguments: { ... } })`.',
-      '',
-      '### Directory of Folded Tools:',
-      ...foldedTools.map((t) => {
-        return `- \`${formatSignature(t)}\`: ${summarizeDescription(t.description, 140)}`
-      }),
-    ]
-
-    assembly.sections.push({
-      name: 'tools:lazy-directory',
-      text: inventoryLines.join('\n'),
-    })
-
-    return assembly
+  ctx.on('agent/status', ({ agent, status }) => {
+    if (status === 'running') refreshFolding(agent)
   })
+
+  // One disclosure section per agent, on the agent's own context, so it leaves
+  // with that agent and cannot leak one session's folded list into another.
+  const installDirectory = (agent: Agent): void => {
+    agent.ctx.systemPrompt.section({
+      name: 'tools:lazy-directory',
+      order: agent.ctx.systemPrompt.getSectionOrder('TOOLS_SDK') - 1,
+      interpolate: false,
+      text: () => folding.get(agent)?.text ?? '',
+    })
+  }
+
+  for (const agent of ctx.get('agents')?.list() ?? []) {
+    if (isFoldingEnabled(ctx, config)) installDirectory(agent)
+    refreshFolding(agent)
+  }
+  ctx.on('agent/created', ({ agent }) => {
+    if (isFoldingEnabled(ctx, config)) installDirectory(agent)
+    refreshFolding(agent)
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    folding.get(agent)?.dispose()
+    folding.delete(agent)
+  })
+}
+
+/**
+ * Progressive-disclosure directory text for the tools hidden from one agent.
+ * @param folded - the hidden tools, with the description each still advertises.
+ * @returns the prompt section telling the model how to reach them.
+ */
+function renderDirectory(
+  folded: readonly { readonly name: string; readonly description: string; parameters?: unknown }[],
+): string {
+  return [
+    '## Specialized & Domain Tools (Progressive Disclosure)',
+    'To optimize KV Cache and context tokens, full parameter schemas for specialized domain tools are folded.',
+    '- To search/discover tools: call `list_tools({ query: "<keyword>" })` (returns complete descriptions and parameter schemas for matching tools in one call).',
+    '- To view all tool categories or directory: call `list_tools({ action: "list" })`.',
+    '- To inspect complete parameter specifications: call `get_tool_schema({ name: "<tool_name>" })`.',
+    '- To execute any folded tool: call `call_tool({ name: "<tool_name>", arguments: { ... } })`.',
+    '',
+    '### Directory of Folded Tools:',
+    ...folded.map(tool => `- \`${formatSignature(tool)}\`: ${summarizeDescription(tool.description, 140)}`),
+  ].join('\n')
 }

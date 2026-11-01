@@ -76,6 +76,24 @@ Fast, lightweight turn-by-turn latency. On-demand 3-step execution:
 
 ---
 
+## 📌 DSH Version Compatibility
+
+This plugin tracks DeepSeek Harness's **pre-stable** plugin APIs, so it is pinned to specific DSH versions.
+
+| Plugin | DeepSeek Harness | Folding seam |
+|---|---|---|
+| `1.2.0` | `>= 0.2.2-alpha.2` | `tools.restrict()` per agent; batch tool-execution API |
+| `1.1.0` and earlier | `< 0.2.2-alpha.2` | mutates `system-prompt/assemble`; single-call executor input |
+
+**Do not mix these rows.** Running an older plugin on a newer DSH (or the reverse) fails in ways that look unrelated to this plugin:
+
+- **`Cannot read properties of undefined (reading 'length')`, reported with code `UNKNOWN`, failing every turn after a model switch.** Releases up to `1.1.0` read `assembly.tools` inside the `system-prompt/assemble` waterfall. That waterfall is handed a `PromptPresentation` — sections, contexts and variables — and DSH assigns `tools` from its own local variable *after* the waterfall returns, so the field is never part of the value listeners receive. Reading `.length` off it throws during step preparation, which aborts the turn before any request is sent.
+- **`tool "list_tools" is already registered`.** A bundle listing this plugin once in the host plane and again in an agent preset mounts it twice. `1.2.0` makes the meta-tools idempotent per process; earlier releases fail the whole composition.
+
+`1.2.0` folds per agent: `tools.restrict()` on the agent's own context hides folded tools from that agent's schema, lookup **and** execution, and the disclosure directory is a section on the same context. Register the plugin in **one plane only** — the preset whose agents should fold, or the host when every agent folds identically.
+
+---
+
 ## 🚀 Installation & Setup
 
 ### Method 1: Direct Installation in DSH Web UI (Recommended)

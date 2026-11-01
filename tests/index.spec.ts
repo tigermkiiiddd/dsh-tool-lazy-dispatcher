@@ -2,8 +2,46 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import { ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
 import * as LazyDispatcher from '../src/index.ts'
+
+/** Scripted adapter: one canned chunk array per model request. */
+class MockAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+  constructor(private readonly script: StreamChunk[][]) { super() }
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model })
+  }
+
+  async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options)
+    const entry = this.script.shift()
+    if (entry === undefined) throw new Error('MockAdapter: script exhausted')
+    for (const chunk of entry) yield chunk
+  }
+}
+
+/** One completed text response. */
+function textResponse(text: string): StreamChunk[] {
+  return [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    ...Array.from(text, (char): StreamChunk => ({ type: 'text-delta', index: 0, text: char })),
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
+    { type: 'usage', usage: { inputTokens: 10, outputTokens: text.length } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+}
+
 
 const testSignal = new AbortController().signal
 
@@ -11,8 +49,69 @@ async function setup(config: LazyDispatcher.Config = {}) {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  // `tools.execute()` dispatches through the selected executor, so the composition
+  // needs one; every shipped profile mounts the native executor.
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(LazyDispatcher, config)
   return ctx
+}
+
+/**
+ * Composition with an Agent registry: folding is per agent, because
+ * `tools.restrict()` requires an agent-scoped context.
+ * @param config - plugin configuration.
+ * @returns the context, one created agent, and `run`, which drives one turn and
+ *   returns the assembly the request actually used.
+ */
+async function setupWithAgent(
+  config: LazyDispatcher.Config = {},
+): Promise<{ ctx: Context; agent: Agent; run: () => Promise<PromptAssembly> }> {
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
+  await ctx.plugin(LazyDispatcher, config)
+  await ctx.plugin(AgentRegistry)
+  await ctx.plugin(AgentLoop, { agents: [] })
+  const adapter = new MockAdapter([textResponse('ok')])
+  ctx.llm.registerAdapter(['test'], adapter)
+  const agent = await ctx.agentLoop.create(SessionId('lazy-folding-test'), { provider: 'test', model: 'test' })
+  const run = async (): Promise<PromptAssembly> => {
+    const idle = waitForIdle(ctx, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }))
+    await idle
+    // Re-assemble inside the same running-less state so the fold the turn installed
+    // is observable without driving a second request.
+    return ctx.systemPrompt.assemble({ agent, scope: agent })
+  }
+  return { ctx, agent, run }
+}
+
+/** Wait for the agent's next transition to idle after a waking send. */
+function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
+  return new Promise((resolve) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
+      if (subject === agent && status === 'idle') { dispose(); resolve() }
+    })
+  })
+}
+
+async function runSingleTool(ctx: Context, name: string, args: unknown, callId = 'test-call') {
+  const batch = await ctx.tools.execute({
+    calls: [{
+      type: 'tool-call',
+      id: ToolCallId(callId),
+      name,
+      arguments: JSON.stringify(args),
+    }],
+    signal: testSignal,
+  })
+  const outcome = batch.results[0]?.result
+  if (!outcome) throw new Error('no result')
+  return outcome
 }
 
 const mockHeavyTool = defineTool({
@@ -42,12 +141,7 @@ describe('tool-lazy-dispatcher plugin', () => {
     const ctx = await setup()
     ctx.tools.register(mockHeavyTool)
 
-    const result = await ctx.tools.execute({
-      callId: ToolCallId('test-call-1'),
-      name: 'get_tool_schema',
-      arguments: { name: 'heavy_domain_tool' },
-      signal: testSignal,
-    })
+    const result = await runSingleTool(ctx, 'get_tool_schema', { name: 'heavy_domain_tool' }, 'test-call-1')
 
     expect(result.isError).toBe(false)
     if (!result.isError) {
@@ -62,15 +156,10 @@ describe('tool-lazy-dispatcher plugin', () => {
     const ctx = await setup()
     ctx.tools.register(mockHeavyTool)
 
-    const result = await ctx.tools.execute({
-      callId: ToolCallId('test-call-2'),
-      name: 'call_tool',
-      arguments: {
-        name: 'heavy_domain_tool',
-        arguments: { dataset: 'sales_2026', iterations: 5 },
-      },
-      signal: testSignal,
-    })
+    const result = await runSingleTool(ctx, 'call_tool', {
+      name: 'heavy_domain_tool',
+      arguments: { dataset: 'sales_2026', iterations: 5 },
+    }, 'test-call-2')
 
     expect(result.isError).toBe(false)
     if (!result.isError) {
@@ -83,7 +172,7 @@ describe('tool-lazy-dispatcher plugin', () => {
   })
 
   it('folds non-pinned tools and injects text directory into system-prompt', async () => {
-    const ctx = await setup()
+    const { ctx, agent, run } = await setupWithAgent()
     ctx.tools.register(mockHeavyTool)
 
     // Register a standard pinned tool (e.g., read)
@@ -95,14 +184,15 @@ describe('tool-lazy-dispatcher plugin', () => {
       async execute() { return 'ok' },
     }))
 
-    const assembly = await ctx.systemPrompt.assemble()
+    // Folding installs on the running transition, so the assertion runs after a turn.
+    const assembly = await run()
 
     // Active tools should keep read, get_tool_schema, and call_tool
     const toolNames = assembly.tools.map(t => t.name)
     expect(toolNames).toContain('read')
     expect(toolNames).toContain('get_tool_schema')
     expect(toolNames).toContain('call_tool')
-    // heavy_domain_tool should be folded away from assembly.tools!
+    // heavy_domain_tool should be folded away from this agent's tools!
     expect(toolNames).not.toContain('heavy_domain_tool')
 
     // System prompt sections should include the folded tool directory
@@ -114,12 +204,12 @@ describe('tool-lazy-dispatcher plugin', () => {
   })
 
   it('does not fold tools when lazyToolFolding is false in config', async () => {
-    const ctx = await setup({ lazyToolFolding: false })
+    const { ctx, agent, run } = await setupWithAgent({ lazyToolFolding: false })
     ctx.tools.register(mockHeavyTool)
 
-    const assembly = await ctx.systemPrompt.assemble()
+    const assembly = await run()
     const toolNames = assembly.tools.map(t => t.name)
-    // When disabled, heavy_domain_tool stays in assembly.tools
+    // When disabled, heavy_domain_tool stays in the agent's tools
     expect(toolNames).toContain('heavy_domain_tool')
     const lazySection = assembly.sections.find(s => s.name === 'tools:lazy-directory')
     expect(lazySection).toBeUndefined()
@@ -128,8 +218,12 @@ describe('tool-lazy-dispatcher plugin', () => {
   it('allows folding default tools when user customizes pinned list, while always keeping mandatory meta-tools', async () => {
     // Register settings service mock with user-customized pinned list that excludes 'read'
     const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     ctx.provide('settings', {
       describe: () => [
         {
@@ -143,6 +237,8 @@ describe('tool-lazy-dispatcher plugin', () => {
       ],
     } as any)
     await ctx.plugin(LazyDispatcher)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(AgentLoop, { agents: [] })
 
     ctx.tools.register(mockHeavyTool)
     ctx.tools.register(defineTool({
@@ -153,7 +249,8 @@ describe('tool-lazy-dispatcher plugin', () => {
       async execute() { return 'ok' },
     }))
 
-    const assembly = await ctx.systemPrompt.assemble()
+    const agent = await ctx.agentLoop.create(SessionId('lazy-pinned-test'), { provider: 'test', model: 'test' })
+    const assembly = await ctx.systemPrompt.assemble({ agent, scope: agent })
     const toolNames = assembly.tools.map(t => t.name)
 
     // User explicitly pinned heavy_domain_tool, so it stays active
@@ -171,12 +268,7 @@ describe('tool-lazy-dispatcher plugin', () => {
     ctx.tools.register(mockHeavyTool)
 
     // 1. Search by keyword
-    const searchResult = await ctx.tools.execute({
-      callId: ToolCallId('search-call-1'),
-      name: 'list_tools',
-      arguments: { action: 'search', query: 'heavy' },
-      signal: testSignal,
-    })
+    const searchResult = await runSingleTool(ctx, 'list_tools', { action: 'search', query: 'heavy' }, 'search-call-1')
     expect(searchResult.isError).toBe(false)
     if (!searchResult.isError) {
       const block = searchResult.content[0]
@@ -188,12 +280,7 @@ describe('tool-lazy-dispatcher plugin', () => {
     }
 
     // 2. Search non-matching query
-    const missResult = await ctx.tools.execute({
-      callId: ToolCallId('search-call-2'),
-      name: 'list_tools',
-      arguments: { action: 'search', query: 'non_existent_xyz' },
-      signal: testSignal,
-    })
+    const missResult = await runSingleTool(ctx, 'list_tools', { action: 'search', query: 'non_existent_xyz' }, 'search-call-2')
     expect(missResult.isError).toBe(false)
     if (!missResult.isError) {
       const block = missResult.content[0]
@@ -232,12 +319,7 @@ describe('tool-lazy-dispatcher plugin', () => {
     })
     ctx.tools.register(mockImageTool)
 
-    const result = await ctx.tools.execute({
-      callId: ToolCallId('call-img-1'),
-      name: 'call_tool',
-      arguments: { name: 'screenshot_tool' },
-      signal: testSignal,
-    })
+    const result = await runSingleTool(ctx, 'call_tool', { name: 'screenshot_tool' }, 'call-img-1')
 
     expect(result.isError).toBe(false)
     if (!result.isError) {
@@ -553,7 +635,7 @@ describe('tool-lazy-dispatcher plugin', () => {
       output: {
         schema: { type: 'json' },
         render: (_args, val) => [{ type: 'text', text: JSON.stringify(val) }],
-        presentationMeta: (args) => ({ echoedKey: args.key }),
+        presentationMeta: args => ({ echoedKey: args.key }),
       },
       async execute(args) {
         return { success: true, key: args.key }
@@ -572,15 +654,10 @@ describe('tool-lazy-dispatcher plugin', () => {
     expect(extractedMeta).toEqual({ score: 99 })
 
     // Test execution through tool runner forwards meta
-    const execResult = await ctx.tools.execute({
-      callId: ToolCallId('meta-test-call'),
-      name: 'call_tool',
-      arguments: {
-        name: 'tool_with_meta',
-        arguments: { key: 'alpha' },
-      },
-      signal: testSignal,
-    })
+    const execResult = await runSingleTool(ctx, 'call_tool', {
+      name: 'tool_with_meta',
+      arguments: { key: 'alpha' },
+    }, 'meta-test-call')
 
     expect(execResult.isError).toBe(false)
     if (!execResult.isError) {
@@ -622,12 +699,7 @@ describe('tool-lazy-dispatcher plugin', () => {
     }))
 
     // Search query matches all 3 tools
-    const searchResult = await ctx.tools.execute({
-      callId: ToolCallId('search-full-usage-call'),
-      name: 'list_tools',
-      arguments: { action: 'search', query: 'batch_match' },
-      signal: testSignal,
-    })
+    const searchResult = await runSingleTool(ctx, 'list_tools', { action: 'search', query: 'batch_match' }, 'search-full-usage-call')
 
     expect(searchResult.isError).toBe(false)
     if (!searchResult.isError) {
@@ -655,12 +727,7 @@ describe('tool-lazy-dispatcher plugin', () => {
     const ctx = await setup()
     ctx.tools.register(mockHeavyTool)
 
-    const listResult = await ctx.tools.execute({
-      callId: ToolCallId('list-catalog-call'),
-      name: 'list_tools',
-      arguments: { action: 'list' },
-      signal: testSignal,
-    })
+    const listResult = await runSingleTool(ctx, 'list_tools', { action: 'list' }, 'list-catalog-call')
 
     expect(listResult.isError).toBe(false)
     if (!listResult.isError) {
@@ -678,14 +745,9 @@ describe('tool-lazy-dispatcher plugin', () => {
     const ctx = await setup()
     ctx.tools.register(mockHeavyTool)
 
-    const result = await ctx.tools.execute({
-      callId: ToolCallId('batch-schema-call'),
-      name: 'get_tool_schema',
-      arguments: {
-        names: ['heavy_domain_tool', 'non_existent_tool_123'],
-      },
-      signal: testSignal,
-    })
+    const result = await runSingleTool(ctx, 'get_tool_schema', {
+      names: ['heavy_domain_tool', 'non_existent_tool_123'],
+    }, 'batch-schema-call')
 
     expect(result.isError).toBe(false)
     if (!result.isError) {
@@ -707,12 +769,7 @@ describe('tool-lazy-dispatcher plugin', () => {
   it('get_tool_schema throws error when neither name nor names is provided', async () => {
     const ctx = await setup()
 
-    const result = await ctx.tools.execute({
-      callId: ToolCallId('empty-schema-call'),
-      name: 'get_tool_schema',
-      arguments: {},
-      signal: testSignal,
-    })
+    const result = await runSingleTool(ctx, 'get_tool_schema', {}, 'empty-schema-call')
 
     expect(result.isError).toBe(true)
     if (result.isError) {
@@ -741,15 +798,10 @@ describe('tool-lazy-dispatcher plugin', () => {
     ctx.tools.register(mockTool)
 
     // Call with unknown key 'arguments' instead of declared 'args'
-    const errorResult = await ctx.tools.execute({
-      callId: ToolCallId('unknown-keys-call'),
-      name: 'call_tool',
-      arguments: {
-        name: 'mcp__mock_gateway',
-        arguments: { name: 'test_node', arguments: { foo: 'bar' } },
-      },
-      signal: testSignal,
-    })
+    const errorResult = await runSingleTool(ctx, 'call_tool', {
+      name: 'mcp__mock_gateway',
+      arguments: { name: 'test_node', arguments: { foo: 'bar' } },
+    }, 'unknown-keys-call')
 
     expect(errorResult.isError).toBe(true)
     if (errorResult.isError) {
@@ -759,15 +811,10 @@ describe('tool-lazy-dispatcher plugin', () => {
     }
 
     // Call with valid declared keys succeeds and does not alter output
-    const successResult = await ctx.tools.execute({
-      callId: ToolCallId('success-keys-call'),
-      name: 'call_tool',
-      arguments: {
-        name: 'mcp__mock_gateway',
-        arguments: { name: 'test_node', args: { foo: 'bar' } },
-      },
-      signal: testSignal,
-    })
+    const successResult = await runSingleTool(ctx, 'call_tool', {
+      name: 'mcp__mock_gateway',
+      arguments: { name: 'test_node', args: { foo: 'bar' } },
+    }, 'success-keys-call')
 
     expect(successResult.isError).toBe(false)
     if (!successResult.isError) {
