@@ -53,15 +53,17 @@
     "test": "vitest run"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "*",
-    "@deepseek-ai/dsh-llm": "*",
-    "@deepseek-ai/dsh-settings": "*",
-    "@deepseek-ai/dsh-system-prompt": "*",
-    "@deepseek-ai/dsh-tools": "*"
+    "@deepseek-ai/dsh-llm": "^0.2.2-alpha.2",
+    "@deepseek-ai/dsh-tools": "^0.2.2-alpha.2"
   },
   "devDependencies": {
     "tsdown": "^0.22.2",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.0",
+    "@deepseek-ai/cordis": "^4.0.6-alpha.1",
+    "@deepseek-ai/dsh-agent": "^0.2.2-alpha.2",
+    "@deepseek-ai/dsh-settings": "^0.2.2-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.2-alpha.2",
+    "@deepseek-ai/schemastery": "^3.18.5"
   }
 }
