@@ -76,9 +76,31 @@
 
 ## 🚀 安装与启用
 
-### 在 DeepSeek Harness 中使用
+### 方式一：在 DSH 图形界面直接安装（最推荐）
 
-1. 在项目或 profile 的 `package.json` 中添加依赖：
+1. 打开 DeepSeek Harness Web UI 或桌面客户端。
+2. 进入 **插件管理 / 设置** 页面，点击 **「添加插件」** 按钮。
+3. 在弹出的输入框中直接粘贴本项目的 GitHub 仓库地址：
+   ```text
+   https://github.com/tigermkiiiddd/dsh-tool-lazy-dispatcher
+   ```
+   *(亦可简写输入 `github:tigermkiiiddd/dsh-tool-lazy-dispatcher` 或 `tigermkiiiddd/dsh-tool-lazy-dispatcher`)*
+4. 点击 **「安装」**，DSH 将自动下载代码、构建并挂载生效。
+
+---
+
+### 方式二：通过 DSH CLI 命令行安装
+
+在 DSH 根目录或对应 profile 下执行：
+```bash
+dsh plugin install github:tigermkiiiddd/dsh-tool-lazy-dispatcher
+```
+
+---
+
+### 方式三：手动配置与二次开发
+
+1. 在项目或 profile 中安装依赖：
 ```bash
 pnpm add dsh-tool-lazy-dispatcher
 ```
@@ -87,7 +109,7 @@ pnpm add dsh-tool-lazy-dispatcher
 ```yaml
 - insert:
     - id: tool-lazy-dispatcher
-      name: '@deepseek-ai/dsh-tool-lazy-dispatcher'
+      name: 'dsh-tool-lazy-dispatcher'
       config:
         # 可选：配置额外常驻的高频工具名单（如截图工具）
         pinnedTools:

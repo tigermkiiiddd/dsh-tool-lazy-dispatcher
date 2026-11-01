@@ -1,0 +1,3 @@
+- insert:
+    - id: tool-lazy-dispatcher
+      name: 'dsh-tool-lazy-dispatcher'

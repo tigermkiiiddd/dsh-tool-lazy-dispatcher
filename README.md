@@ -76,9 +76,31 @@ Fast, lightweight turn-by-turn latency. On-demand 3-step execution:
 
 ## 🚀 Installation & Setup
 
-### Inside DeepSeek Harness
+### Method 1: Direct Installation in DSH Web UI (Recommended)
 
-1. Install the package into your project or profile:
+1. Open DeepSeek Harness Web UI or desktop client.
+2. Go to **Settings / Plugins** and click **"Add Plugin"** (添加插件).
+3. In the modal input, enter this GitHub repository address directly:
+   ```text
+   https://github.com/tigermkiiiddd/dsh-tool-lazy-dispatcher
+   ```
+   *(Or shorthand: `github:tigermkiiiddd/dsh-tool-lazy-dispatcher` or `tigermkiiiddd/dsh-tool-lazy-dispatcher`)*
+4. Click **"Install"** (安装). DSH will automatically clone, build, and mount the plugin layer.
+
+---
+
+### Method 2: Via DSH CLI
+
+Run inside your DSH workspace or profile:
+```bash
+dsh plugin install github:tigermkiiiddd/dsh-tool-lazy-dispatcher
+```
+
+---
+
+### Method 3: Manual Monorepo / Profile Patch
+
+1. Install the package into your project:
 ```bash
 pnpm add dsh-tool-lazy-dispatcher
 ```
@@ -87,7 +109,7 @@ pnpm add dsh-tool-lazy-dispatcher
 ```yaml
 - insert:
     - id: tool-lazy-dispatcher
-      name: '@deepseek-ai/dsh-tool-lazy-dispatcher'
+      name: 'dsh-tool-lazy-dispatcher'
       config:
         # Optional: pin additional high-frequency tools (e.g. screenshots)
         pinnedTools:
