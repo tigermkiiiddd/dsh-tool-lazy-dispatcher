@@ -16,6 +16,8 @@
   "files": [
     "lib",
     "src",
+    "tests",
+    "scripts",
     "README.md",
     "README.zh-CN.md",
     "LICENSE",
@@ -50,7 +52,8 @@
   "homepage": "https://github.com/tigermkiiiddd/dsh-tool-lazy-dispatcher#readme",
   "scripts": {
     "build": "tsdown",
-    "test": "vitest run"
+    "test": "node scripts/test-in-dsh.mjs",
+    "test:direct": "vitest run"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": "^0.2.2-alpha.2",

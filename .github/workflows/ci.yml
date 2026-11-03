@@ -1,0 +1,74 @@
+name: CI
+
+# 为什么 CI 要拉 DSH 仓库：
+# 这个插件的测试跑的是真实 DSH 组件（Context / ToolRuntime / AgentLoop / 原生执行器），
+# 而 dsh-agent-loop、dsh-session、dsh-session-projection、dsh-tool-executor-native
+# 这几个包**没有发布到 npm**，只在 DSH monorepo 内部。直接 `pnpm install && pnpm test`
+# 在裸仓库里必然因为解析不到它们而失败。所以 CI 的做法是：
+#   1. 检出 DSH 基线（default: rebuild-team 的 aca9e63e2d，见环境变量）
+#   2. 在 DSH workspace 里安装依赖（它的 pnpm 会把内部包全部链好）
+#   3. 把本仓库的 src/tests 拷进 DSH 的 `packages/<group>/<pkg>/` 两级目录
+#      （DSH 的 vitest include 是 packages/*/*/tests/**，少一级都匹配不到）
+#   4. 用 DSH 自己的 vitest 跑，跑完删掉临时目录
+#
+# 这样跑到的实现与用户机器上运行的完全同一份，而不是 npm 上可能滞后的副本。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # DSH 基线：升级下游 API 时在这里改一处即可
+  DSH_REPO: https://github.com/deepseek-ai/deepseek-harness.git
+  DSH_REF: aca9e63e2d4fb366d2129bb262e134a7cfecdbf6
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Checkout DSH baseline
+        uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ env.DSH_REF }}
+          path: dsh
+          # DSH 是私有/半公开仓库；在有访问权限的环境里配 DSH_CHECKOUT_TOKEN，
+          # 没有配时回退到公开检出（公开仓库不需要 token）。
+          token: ${{ secrets.DSH_CHECKOUT_TOKEN || github.token }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install DSH workspace dependencies
+        working-directory: dsh
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage plugin into DSH workspace
+        run: |
+          # DSH 的 vitest include 要求 packages/<group>/<pkg>/tests/**
+          STAGE=dsh/packages/ci/lazy-dispatcher
+          mkdir -p "$STAGE/tests" "$STAGE/src"
+          cp -r plugin/tests/. "$STAGE/tests/"
+          cp -r plugin/src/. "$STAGE/src/"
+          echo "staged files:"
+          find "$STAGE" -type f | sed "s#^#  #"
+
+      - name: Run plugin tests against real DSH components
+        working-directory: dsh
+        run: pnpm exec vitest run packages/ci/lazy-dispatcher/tests
+
+      - name: Clean staged files
+        if: always()
+        run: rm -rf dsh/packages/ci

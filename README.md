@@ -212,11 +212,28 @@ Universal dispatch proxy to execute folded tools.
 
 ## 🧪 Testing
 
-The repository includes a comprehensive Vitest suite covering meta-tool registration, fuzzy discovery, schema querying, dispatch execution, and multimodal `ImageBlock` preservation:
+The repository includes a comprehensive Vitest suite covering meta-tool registration, fuzzy discovery, schema querying, dispatch execution, and multimodal `ImageBlock` preservation.
+
+### Why you cannot just run `pnpm test`
+
+The tests exercise **real DSH components** (`Context`, `ToolRuntime`, `AgentLoop`, the native tool executor), not stubs. Four of those packages — `dsh-agent-loop`, `dsh-session`, `dsh-session-projection`, `dsh-tool-executor-native` — are **not published to npm**; they only exist inside the DSH monorepo. A bare `pnpm install && pnpm test` in this repository therefore fails at module resolution.
+
+### How to run them
+
+Point the script at a DSH checkout; it stages this repository's `src/` and `tests/` into the DSH workspace (two-level `packages/<group>/<pkg>/` path, which the DSH vitest include requires), runs the suite with DSH's own Vitest, then cleans up:
 
 ```bash
-pnpm test
+# DSH checkout is auto-discovered next to this repo, or via DSH_HOME
+node scripts/test-in-dsh.mjs
+
+# explicit location
+node scripts/test-in-dsh.mjs --dsh /path/to/deepseek-harness
+
+# keep the staged copy for debugging
+node scripts/test-in-dsh.mjs --keep
 ```
+
+CI (`.github/workflows/ci.yml`) does the same thing against the pinned DSH baseline, so a test failure there always reflects the real runtime rather than a stale npm copy.
 
 ---
 

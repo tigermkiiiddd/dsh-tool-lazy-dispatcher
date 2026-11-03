@@ -210,13 +210,30 @@ pnpm add github:tigermkiiiddd/dsh-tool-lazy-dispatcher
 
 ---
 
-## 🧪 单元测试
+## 🧪 测试
 
-本项目自带完整的单元测试套件，涵盖元工具注册、动态搜索、Schema 按需查询、代理执行、系统提示词拦截、以及多模态 `ImageBlock` 保真透传测试：
+仓库自带一套 Vitest 用例，覆盖元工具注册、模糊检索、schema 查询、派发执行与多模态 `ImageBlock` 保真。
+
+### 为什么不能直接 `pnpm test`
+
+用例跑的是**真实 DSH 组件**（`Context`、`ToolRuntime`、`AgentLoop`、原生工具执行器），不是桩。其中 `dsh-agent-loop`、`dsh-session`、`dsh-session-projection`、`dsh-tool-executor-native` **没有发布到 npm**，只存在于 DSH monorepo 内部。因此在本仓库裸跑 `pnpm install && pnpm test` 一定会在解析阶段失败。
+
+### 怎么跑
+
+把脚本指向一个 DSH 检出即可：它会把本仓库的 `src/` 与 `tests/` 暂存进 DSH workspace（必须是 `packages/<group>/<pkg>/` 两级目录，DSH 的 vitest include 才匹配得到），用 DSH 自己的 Vitest 跑完再清理：
 
 ```bash
-pnpm test
+# DSH 检出放在本仓库旁边会被自动发现，也可以用 DSH_HOME 指定
+node scripts/test-in-dsh.mjs
+
+# 显式指定位置
+node scripts/test-in-dsh.mjs --dsh /path/to/deepseek-harness
+
+# 保留暂存副本，便于排查
+node scripts/test-in-dsh.mjs --keep
 ```
+
+CI（`.github/workflows/ci.yml`）对固定的 DSH 基线做同样的事——所以那边的失败永远反映真实运行时，而不是 npm 上滞后的副本。
 
 ---
 
